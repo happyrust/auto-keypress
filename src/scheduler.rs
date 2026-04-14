@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::key_sender::{VirtualKey, send_key};
+use crate::key_sender::{SendMode, VirtualKey, send_key};
 
 #[derive(Clone, Debug)]
 pub struct KeyTask {
@@ -25,16 +25,18 @@ pub struct SendStats {
 pub struct Scheduler {
     target_hwnd: isize,
     tasks: Vec<KeyTask>,
+    mode: SendMode,
     running: Arc<AtomicBool>,
     stats: Arc<Mutex<SendStats>>,
     handles: Vec<thread::JoinHandle<()>>,
 }
 
 impl Scheduler {
-    pub fn new(target_hwnd: isize, tasks: Vec<KeyTask>) -> Self {
+    pub fn new(target_hwnd: isize, tasks: Vec<KeyTask>, mode: SendMode) -> Self {
         Self {
             target_hwnd,
             tasks,
+            mode,
             running: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Mutex::new(SendStats::default())),
             handles: Vec::new(),
@@ -57,12 +59,13 @@ impl Scheduler {
             let stats = Arc::clone(&self.stats);
             let hwnd = self.target_hwnd;
             let task = task.clone();
+            let mode = self.mode;
 
             let handle = thread::spawn(move || {
                 let interval = Duration::from_millis(task.interval_ms);
                 while running.load(Ordering::SeqCst) {
                     let start = Instant::now();
-                    send_key(hwnd, task.vk);
+                    send_key(hwnd, task.vk, mode);
 
                     {
                         let mut s = stats.lock().unwrap();

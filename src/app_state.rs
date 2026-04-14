@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use gpui::{
     AppContext, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Render, WeakEntity, Window,
     prelude::{FluentBuilder, InteractiveElement, IntoElement, ParentElement, Styled,
@@ -10,7 +11,7 @@ use gpui::{
 use gpui_component::{Sizable, h_flex, v_flex};
 use gpui_component::input::{Input, InputState};
 
-use crate::key_sender::VirtualKey;
+use crate::key_sender::{SendMode, VirtualKey};
 use crate::scheduler::{KeyTask, Scheduler, SendStats};
 use crate::window_picker::WindowInfo;
 
@@ -34,6 +35,26 @@ fn start_window_drag(window: &Window) {
 
 #[cfg(not(target_os = "windows"))]
 fn start_window_drag(_window: &Window) {}
+
+#[cfg(target_os = "windows")]
+fn set_always_on_top(window: &Window, on_top: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    if let Ok(handle) = HasWindowHandle::window_handle(window) {
+        if let RawWindowHandle::Win32(h) = handle.as_raw() {
+            let hwnd = h.hwnd.get() as *mut std::ffi::c_void;
+            let insert_after = if on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            unsafe {
+                SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_always_on_top(_window: &Window, _on_top: bool) {}
 
 const BG: u32 = 0x2D2D2D;
 const SECONDARY: u32 = 0x3A3A3A;
@@ -101,10 +122,14 @@ pub struct AppState {
     pub key_tasks: Vec<KeyTask>,
     pub interval_inputs: HashMap<u32, Entity<InputState>>,
     pub recording_task_id: Option<u32>,
+    pub send_mode: SendMode,
     pub scheduler: Option<Scheduler>,
     pub is_running: bool,
     pub is_picking: bool,
     pub stats: SendStats,
+    pub always_on_top: bool,
+    #[allow(dead_code)]
+    hotkey_manager: Option<GlobalHotKeyManager>,
 }
 
 impl AppState {
@@ -112,25 +137,155 @@ impl AppState {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
 
-        let first_id = next_id();
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("200"));
+        let cfg = crate::config::load_config();
 
+        let mut key_tasks = Vec::new();
         let mut interval_inputs = HashMap::new();
-        interval_inputs.insert(first_id, input);
+
+        for tc in &cfg.tasks {
+            let tid = next_id();
+            key_tasks.push(KeyTask {
+                id: tid,
+                vk: VirtualKey(tc.vk),
+                interval_ms: tc.interval_ms,
+            });
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder(&tc.interval_ms.to_string())
+            });
+            interval_inputs.insert(tid, input);
+        }
+
+        if key_tasks.is_empty() {
+            let tid = next_id();
+            key_tasks.push(KeyTask { id: tid, vk: VirtualKey(0x0D), interval_ms: 200 });
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("200"));
+            interval_inputs.insert(tid, input);
+        }
+
+        let hotkey_manager = Self::register_global_hotkey();
+        Self::start_hotkey_listener(cx);
+        Self::start_stats_timer(cx);
+
+        if cfg.always_on_top {
+            set_always_on_top(window, true);
+        }
 
         Self {
             focus_handle,
             target_window: None,
-            key_tasks: vec![
-                KeyTask { id: first_id, vk: VirtualKey(0x0D), interval_ms: 200 },
-            ],
+            key_tasks,
             interval_inputs,
             recording_task_id: None,
+            send_mode: cfg.send_mode_enum(),
             scheduler: None,
             is_running: false,
             is_picking: false,
             stats: SendStats::default(),
+            always_on_top: cfg.always_on_top,
+            hotkey_manager,
         }
+    }
+
+    pub fn save_config(&self, cx: &Context<Self>) {
+        self.sync_intervals_snapshot(cx);
+        let tasks: Vec<(VirtualKey, u64)> = self.key_tasks
+            .iter()
+            .map(|t| (t.vk, t.interval_ms))
+            .collect();
+        let cfg = crate::config::config_from_state(self.send_mode, self.always_on_top, &tasks);
+        crate::config::save_config(&cfg);
+    }
+
+    fn sync_intervals_snapshot(&self, cx: &Context<Self>) {
+        for task in &self.key_tasks {
+            if let Some(input_entity) = self.interval_inputs.get(&task.id) {
+                let text = input_entity.read(cx).text().to_string();
+                if let Ok(ms) = text.trim().parse::<u64>() {
+                    if ms > 0 {
+                        // interval_ms is on the task which we iterate immutably here
+                        // actual sync happens in sync_intervals_from_inputs
+                    }
+                    let _ = ms;
+                }
+            }
+        }
+    }
+
+    fn register_global_hotkey() -> Option<GlobalHotKeyManager> {
+        let mgr = GlobalHotKeyManager::new().ok()?;
+        match "F9".parse::<HotKey>() {
+            Ok(hk) => {
+                if let Err(e) = mgr.register(hk) {
+                    tracing::warn!("Failed to register F9 hotkey: {e}");
+                    return None;
+                }
+                tracing::info!("Global hotkey F9 registered (toggle start/stop)");
+                Some(mgr)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse hotkey: {e}");
+                None
+            }
+        }
+    }
+
+    fn start_hotkey_listener(cx: &mut Context<Self>) {
+        let hotkey_rx = GlobalHotKeyEvent::receiver().clone();
+        cx.spawn(async move |entity: WeakEntity<Self>, async_app| {
+            loop {
+                let rx = hotkey_rx.clone();
+                let event = async_app.background_executor()
+                    .spawn(async move { rx.recv().ok() })
+                    .await;
+                match event {
+                    Some(ev) if ev.state() == HotKeyState::Pressed => {
+                        let ok = entity.update(async_app, |state, cx| {
+                            state.toggle_running(cx);
+                            cx.notify();
+                        }).is_ok();
+                        if !ok { break; }
+                    }
+                    None => break,
+                    _ => {}
+                }
+            }
+        }).detach();
+    }
+
+    fn start_stats_timer(cx: &mut Context<Self>) {
+        cx.spawn(async move |entity: WeakEntity<Self>, async_app| {
+            loop {
+                async_app.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let ok = entity.update(async_app, |state, cx| {
+                    if state.is_running {
+                        state.refresh_stats();
+                        cx.notify();
+                    }
+                }).is_ok();
+                if !ok { break; }
+            }
+        }).detach();
+    }
+
+    pub fn toggle_running(&mut self, cx: &Context<Self>) {
+        if self.is_running {
+            self.stop();
+            self.save_current_config(cx);
+        } else {
+            self.start(cx);
+        }
+    }
+
+    fn save_current_config(&mut self, cx: &Context<Self>) {
+        self.sync_intervals_from_inputs(cx);
+        let tasks: Vec<(VirtualKey, u64)> = self.key_tasks
+            .iter()
+            .map(|t| (t.vk, t.interval_ms))
+            .collect();
+        let cfg = crate::config::config_from_state(self.send_mode, self.always_on_top, &tasks);
+        crate::config::save_config(&cfg);
     }
 
     pub fn add_key_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -173,7 +328,7 @@ impl AppState {
 
         self.sync_intervals_from_inputs(cx);
 
-        let mut scheduler = Scheduler::new(hwnd, self.key_tasks.clone());
+        let mut scheduler = Scheduler::new(hwnd, self.key_tasks.clone(), self.send_mode);
         scheduler.start();
         self.scheduler = Some(scheduler);
         self.is_running = true;
@@ -310,6 +465,31 @@ impl AppState {
                 h_flex().gap(gpui::px(4.)).items_center()
                     .child(
                         gpui::div()
+                            .id("pin-btn")
+                            .cursor_pointer()
+                            .w(gpui::px(28.))
+                            .h(gpui::px(28.))
+                            .rounded(gpui::px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(self.always_on_top, |s| s.bg(rgb(PRIMARY)))
+                            .when(!self.always_on_top, |s| s.hover(|s| s.bg(rgb(SECONDARY))))
+                            .child(
+                                gpui::div()
+                                    .text_size(gpui::px(12.))
+                                    .text_color(rgb(if self.always_on_top { FG } else { MUTED }))
+                                    .child("📌")
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.always_on_top = !this.always_on_top;
+                                set_always_on_top(window, this.always_on_top);
+                                cx.notify();
+                            }))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    )
+                    .child(
+                        gpui::div()
                             .id("min-btn")
                             .cursor_pointer()
                             .w(gpui::px(28.))
@@ -373,6 +553,7 @@ impl AppState {
             .gap(gpui::px(16.))
             .child(self.render_target_section(target_text, pick_label, is_picking, cx))
             .child(self.render_keys_section(&tasks, cx))
+            .child(self.render_mode_selector(cx))
             .child(gpui::div().w_full().h(gpui::px(1.)).bg(rgb(BORDER)))
             .child(self.render_controls(is_running, has_target, cx))
     }
@@ -599,6 +780,64 @@ impl AppState {
         row
     }
 
+    fn render_mode_selector(&self, cx: &Context<Self>) -> impl IntoElement {
+        let current = self.send_mode;
+        let modes = SendMode::all();
+
+        let mut tabs = h_flex()
+            .h(gpui::px(28.))
+            .bg(rgb(SECONDARY))
+            .rounded(gpui::px(6.))
+            .border_1()
+            .border_color(rgb(BORDER));
+
+        for (i, mode) in modes.iter().enumerate() {
+            let m = *mode;
+            let active = current == m;
+            let is_first = i == 0;
+            let is_last = i == modes.len() - 1;
+
+            let mut tab = gpui::div()
+                .id(("mode", i))
+                .cursor_pointer()
+                .h_full()
+                .px(gpui::px(8.))
+                .flex()
+                .items_center()
+                .bg(rgb(if active { PRIMARY } else { SECONDARY }));
+
+            if is_first { tab = tab.rounded_l(gpui::px(5.)); }
+            if is_last { tab = tab.rounded_r(gpui::px(5.)); }
+
+            tab = tab.child(
+                gpui::div()
+                    .text_size(gpui::px(10.))
+                    .text_color(rgb(if active { FG } else { MUTED }))
+                    .child(m.label().to_string())
+            );
+
+            tab = tab.on_click(cx.listener(move |this, _, _window, cx| {
+                this.send_mode = m;
+                cx.notify();
+            }));
+
+            tabs = tabs.child(tab);
+        }
+
+        h_flex()
+            .w_full()
+            .gap(gpui::px(8.))
+            .items_center()
+            .child(
+                gpui::div()
+                    .text_size(gpui::px(12.))
+                    .text_color(rgb(MUTED))
+                    .child("Send Mode")
+            )
+            .child(gpui::div().flex_grow())
+            .child(tabs)
+    }
+
     fn render_controls(
         &self,
         is_running: bool,
@@ -717,10 +956,19 @@ impl AppState {
                     )
             )
             .child(
-                gpui::div()
-                    .text_size(gpui::px(11.))
-                    .text_color(rgb(MUTED))
-                    .child(stats_text)
+                h_flex().gap(gpui::px(12.)).items_center()
+                    .child(
+                        gpui::div()
+                            .text_size(gpui::px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(stats_text)
+                    )
+                    .child(
+                        gpui::div()
+                            .text_size(gpui::px(10.))
+                            .text_color(rgb(BORDER))
+                            .child("F9: Toggle")
+                    )
             )
     }
 }

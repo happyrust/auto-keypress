@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_state;
+mod config;
 mod key_sender;
 mod scheduler;
 mod window_picker;
