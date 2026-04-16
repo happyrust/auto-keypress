@@ -18,6 +18,12 @@ fn main() {
         )
         .init();
 
+    #[cfg(target_os = "macos")]
+    tracing::info!(
+        "macOS 键盘事件权限就绪: {}",
+        crate::key_sender::accessibility_trusted()
+    );
+
     gpui::Application::new().run(move |cx| {
         gpui_component::init(cx);
 

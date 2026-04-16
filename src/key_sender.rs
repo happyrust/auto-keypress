@@ -36,6 +36,8 @@ type CGEventRef = *const c_void;
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> u8;
+    fn CGPreflightPostEventAccess() -> bool;
+    fn CGRequestPostEventAccess() -> bool;
     fn CGEventCreateKeyboardEvent(
         source: *const c_void,
         virtual_key: u16,
@@ -131,9 +133,15 @@ static ACCESSIBILITY_WARNING: Once = Once::new();
 const ACCESSIBILITY_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
+fn macos_permission_ready(ax_trusted: bool, post_event_trusted: bool) -> bool {
+    ax_trusted || post_event_trusted
+}
+
 #[cfg(target_os = "macos")]
 pub fn accessibility_trusted() -> bool {
-    unsafe { AXIsProcessTrusted() != 0 }
+    let ax_trusted = unsafe { AXIsProcessTrusted() != 0 };
+    let post_event_trusted = unsafe { CGPreflightPostEventAccess() };
+    macos_permission_ready(ax_trusted, post_event_trusted)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -143,6 +151,10 @@ pub fn accessibility_trusted() -> bool {
 
 #[cfg(target_os = "macos")]
 pub fn open_accessibility_settings() -> bool {
+    if unsafe { CGRequestPostEventAccess() } {
+        return true;
+    }
+
     Command::new("open")
         .arg(ACCESSIBILITY_SETTINGS_URL)
         .status()
@@ -331,7 +343,7 @@ pub static KEY_NAMES: &[(&str, VirtualKey)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{VirtualKey, KEY_NAMES};
+    use super::{macos_permission_ready, VirtualKey, KEY_NAMES};
 
     #[cfg(target_os = "macos")]
     use super::{macos_key_code, ACCESSIBILITY_SETTINGS_URL};
@@ -367,5 +379,12 @@ mod tests {
             ACCESSIBILITY_SETTINGS_URL,
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
         );
+    }
+
+    #[test]
+    fn post_event_access_is_enough_for_keyboard_sending_ui() {
+        assert!(macos_permission_ready(false, true));
+        assert!(macos_permission_ready(true, false));
+        assert!(!macos_permission_ready(false, false));
     }
 }

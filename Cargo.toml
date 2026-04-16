@@ -1,6 +1,6 @@
 [package]
 name = "auto-keypress"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Auto key presser with window picker, built with Rust and GPUI."
 
@@ -27,6 +27,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
+objc = "0.2.7"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

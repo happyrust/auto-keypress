@@ -16,7 +16,7 @@ use gpui_component::{h_flex, v_flex, Sizable};
 use crate::i18n::{Language, UiText};
 use crate::key_sender::{SendMode, VirtualKey};
 use crate::scheduler::{KeyTask, Scheduler, SendStats};
-use crate::window_picker::WindowInfo;
+use crate::window_picker::{MousePressSnapshot, WindowInfo};
 
 #[cfg(target_os = "windows")]
 fn start_window_drag(window: &Window) {
@@ -56,7 +56,40 @@ fn set_always_on_top(window: &Window, on_top: bool) {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+const NS_NORMAL_WINDOW_LEVEL: isize = 0;
+#[cfg(target_os = "macos")]
+const NS_POP_UP_WINDOW_LEVEL: isize = 101;
+
+#[cfg(target_os = "macos")]
+fn mac_window_level(on_top: bool) -> isize {
+    if on_top {
+        NS_POP_UP_WINDOW_LEVEL
+    } else {
+        NS_NORMAL_WINDOW_LEVEL
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn set_always_on_top(window: &Window, on_top: bool) {
+    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    if let Ok(handle) = HasWindowHandle::window_handle(window) {
+        if let RawWindowHandle::AppKit(h) = handle.as_raw() {
+            let ns_view = h.ns_view.as_ptr() as *mut Object;
+            unsafe {
+                let ns_window: *mut Object = msg_send![ns_view, window];
+                if !ns_window.is_null() {
+                    let _: () = msg_send![ns_window, setLevel: mac_window_level(on_top)];
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn set_always_on_top(_window: &Window, _on_top: bool) {}
 
 const BG: u32 = 0x2D2D2D;
@@ -99,6 +132,39 @@ fn start_block_reason(
         Some(StartBlockReason::MissingTarget)
     } else {
         None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PickFrame<T> {
+    target: Option<T>,
+    ready_to_confirm: bool,
+    stop_picking: bool,
+    changed: bool,
+}
+
+fn advance_pick_frame<T: Clone>(
+    current_target: Option<&T>,
+    hovered_target: Option<T>,
+    ready_to_confirm: bool,
+    mouse_pressed: bool,
+    mouse_clicked: bool,
+    same_target: impl Fn(&T, &T) -> bool,
+) -> PickFrame<T> {
+    let target = hovered_target.or_else(|| current_target.cloned());
+    let changed = match (current_target, target.as_ref()) {
+        (Some(current), Some(next)) => !same_target(current, next),
+        (None, None) => false,
+        _ => true,
+    };
+    let ready_to_confirm = ready_to_confirm || !mouse_pressed;
+    let stop_picking = ready_to_confirm && (mouse_pressed || mouse_clicked);
+
+    PickFrame {
+        target,
+        ready_to_confirm,
+        stop_picking,
+        changed,
     }
 }
 
@@ -155,6 +221,8 @@ pub struct AppState {
     pub scheduler: Option<Scheduler>,
     pub is_running: bool,
     pub is_picking: bool,
+    pub pick_ready_to_confirm: bool,
+    pub pick_mouse_snapshot: MousePressSnapshot,
     pub stats: SendStats,
     pub language: Language,
     pub always_on_top: bool,
@@ -213,6 +281,8 @@ impl AppState {
             scheduler: None,
             is_running: false,
             is_picking: false,
+            pick_ready_to_confirm: false,
+            pick_mouse_snapshot: MousePressSnapshot::default(),
             stats: SendStats::default(),
             language: cfg.language_enum(),
             always_on_top: cfg.always_on_top,
@@ -405,8 +475,12 @@ impl AppState {
 
     pub fn toggle_pick(&mut self, cx: &mut Context<Self>) {
         self.is_picking = !self.is_picking;
+        self.pick_ready_to_confirm = false;
         if self.is_picking {
+            self.pick_mouse_snapshot = crate::window_picker::capture_mouse_press_snapshot();
             self.start_picking(cx);
+        } else {
+            self.pick_mouse_snapshot = MousePressSnapshot::default();
         }
     }
 
@@ -441,17 +515,35 @@ impl AppState {
                     if !state.is_picking {
                         return false;
                     }
-                    if let Some(info) = crate::window_picker::get_window_under_cursor() {
-                        let changed = state
-                            .target_window
-                            .as_ref()
-                            .map_or(true, |w| !w.matches_target(&info));
-                        if changed {
-                            state.target_window = Some(info);
-                            cx.notify();
-                        }
+                    let mouse_poll =
+                        crate::window_picker::poll_mouse_press(state.pick_mouse_snapshot);
+                    let frame = advance_pick_frame(
+                        state.target_window.as_ref(),
+                        crate::window_picker::get_window_under_cursor(),
+                        state.pick_ready_to_confirm,
+                        mouse_poll.is_pressed,
+                        mouse_poll.saw_new_press,
+                        |current, next| current.matches_target(next),
+                    );
+                    state.pick_mouse_snapshot = mouse_poll.snapshot;
+
+                    if frame.changed {
+                        state.target_window = frame.target;
                     }
-                    true
+
+                    if frame.stop_picking {
+                        state.is_picking = false;
+                        state.pick_ready_to_confirm = false;
+                        state.pick_mouse_snapshot = MousePressSnapshot::default();
+                    } else {
+                        state.pick_ready_to_confirm = frame.ready_to_confirm;
+                    }
+
+                    if frame.changed || frame.stop_picking {
+                        cx.notify();
+                    }
+
+                    !frame.stop_picking
                 })
                 .unwrap_or(false);
 
@@ -1222,7 +1314,10 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{can_start, start_block_reason, StartBlockReason};
+    use super::{advance_pick_frame, can_start, start_block_reason, StartBlockReason};
+
+    #[cfg(target_os = "macos")]
+    use super::{mac_window_level, NS_NORMAL_WINDOW_LEVEL, NS_POP_UP_WINDOW_LEVEL};
 
     #[test]
     fn start_requires_idle_target_and_permission() {
@@ -1248,5 +1343,87 @@ mod tests {
         );
         assert_eq!(start_block_reason(true, false, false), None);
         assert_eq!(start_block_reason(false, true, true), None);
+    }
+
+    #[test]
+    fn pick_does_not_confirm_while_waiting_for_first_release() {
+        let result =
+            advance_pick_frame(Some(&"old"), Some("new"), false, true, false, |a, b| a == b);
+
+        assert_eq!(result.target, Some("new"));
+        assert!(!result.ready_to_confirm);
+        assert!(!result.stop_picking);
+        assert!(result.changed);
+    }
+
+    #[test]
+    fn pick_arms_after_mouse_is_released_once() {
+        let result = advance_pick_frame(
+            Some(&"current"),
+            Some("hovered"),
+            false,
+            false,
+            false,
+            |a, b| a == b,
+        );
+
+        assert_eq!(result.target, Some("hovered"));
+        assert!(result.ready_to_confirm);
+        assert!(!result.stop_picking);
+        assert!(result.changed);
+    }
+
+    #[test]
+    fn pick_stops_immediately_when_mouse_is_pressed_after_arming() {
+        let result = advance_pick_frame(
+            Some(&"current"),
+            Some("hovered"),
+            true,
+            true,
+            false,
+            |a, b| a == b,
+        );
+
+        assert_eq!(result.target, Some("hovered"));
+        assert!(result.ready_to_confirm);
+        assert!(result.stop_picking);
+        assert!(result.changed);
+    }
+
+    #[test]
+    fn pick_keeps_last_target_when_pressing_without_hovered_window() {
+        let result =
+            advance_pick_frame(Some(&"current"), None::<&str>, true, true, false, |a, b| {
+                a == b
+            });
+
+        assert_eq!(result.target, Some("current"));
+        assert!(result.ready_to_confirm);
+        assert!(result.stop_picking);
+        assert!(!result.changed);
+    }
+
+    #[test]
+    fn pick_stops_when_click_happens_between_polls() {
+        let result = advance_pick_frame(
+            Some(&"current"),
+            Some("hovered"),
+            true,
+            false,
+            true,
+            |a, b| a == b,
+        );
+
+        assert_eq!(result.target, Some("hovered"));
+        assert!(result.ready_to_confirm);
+        assert!(result.stop_picking);
+        assert!(result.changed);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_always_on_top_uses_expected_window_levels() {
+        assert_eq!(mac_window_level(false), NS_NORMAL_WINDOW_LEVEL);
+        assert_eq!(mac_window_level(true), NS_POP_UP_WINDOW_LEVEL);
     }
 }

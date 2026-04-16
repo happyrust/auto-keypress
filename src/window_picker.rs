@@ -14,6 +14,10 @@ use windows::Win32::{
         IsWindowVisible, RealGetWindowClassW, WindowFromPoint, GA_ROOT,
     },
 };
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+};
 
 #[cfg(target_os = "macos")]
 type CFArrayRef = *const c_void;
@@ -21,6 +25,12 @@ type CFArrayRef = *const c_void;
 type CFDictionaryRef = *const c_void;
 #[cfg(target_os = "macos")]
 type CFStringRef = *const c_void;
+#[cfg(target_os = "macos")]
+type CGEventType = u32;
+#[cfg(target_os = "macos")]
+type CGEventSourceStateID = i32;
+#[cfg(target_os = "macos")]
+type CGMouseButton = u32;
 
 #[cfg(target_os = "macos")]
 const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
@@ -30,6 +40,20 @@ const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 #[cfg(target_os = "macos")]
 const K_CF_NUMBER_SINT64_TYPE: i32 = 4;
+#[cfg(target_os = "macos")]
+const K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE: CGEventSourceStateID = 0;
+#[cfg(target_os = "macos")]
+const K_CG_EVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
+#[cfg(target_os = "macos")]
+const K_CG_EVENT_RIGHT_MOUSE_DOWN: CGEventType = 3;
+#[cfg(target_os = "macos")]
+const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
+#[cfg(target_os = "macos")]
+const K_CG_MOUSE_BUTTON_LEFT: CGMouseButton = 0;
+#[cfg(target_os = "macos")]
+const K_CG_MOUSE_BUTTON_RIGHT: CGMouseButton = 1;
+#[cfg(target_os = "macos")]
+const K_CG_MOUSE_BUTTON_CENTER: CGMouseButton = 2;
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -72,6 +96,11 @@ pub(crate) struct MacWindowCandidate {
 unsafe extern "C" {
     fn CGEventCreate(source: *const c_void) -> *const c_void;
     fn CGEventGetLocation(event: *const c_void) -> MacPoint;
+    fn CGEventSourceButtonState(state_id: CGEventSourceStateID, button: CGMouseButton) -> bool;
+    fn CGEventSourceCounterForEventType(
+        state_id: CGEventSourceStateID,
+        event_type: CGEventType,
+    ) -> u32;
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
     fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut MacRect) -> u8;
 
@@ -109,7 +138,7 @@ unsafe extern "C" {
     fn CFStringGetTypeID() -> usize;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowInfo {
     #[cfg(target_os = "windows")]
     pub hwnd: isize,
@@ -157,6 +186,136 @@ impl fmt::Display for WindowInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.title)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MousePressSnapshot {
+    pub buttons_down: u8,
+    #[cfg(target_os = "macos")]
+    left_press_count: u32,
+    #[cfg(target_os = "macos")]
+    right_press_count: u32,
+    #[cfg(target_os = "macos")]
+    other_press_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MousePressPoll {
+    pub snapshot: MousePressSnapshot,
+    pub is_pressed: bool,
+    pub saw_new_press: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_mouse_button_state() -> (u8, u8) {
+    let mut buttons_down = 0u8;
+    let mut pressed_since_last_poll = 0u8;
+
+    for (bit, vk) in [(1u8, VK_LBUTTON), (2u8, VK_RBUTTON), (4u8, VK_MBUTTON)] {
+        let state = unsafe { GetAsyncKeyState(vk as i32) } as u16;
+        if (state & 0x8000) != 0 {
+            buttons_down |= bit;
+        }
+        if (state & 0x0001) != 0 {
+            pressed_since_last_poll |= bit;
+        }
+    }
+
+    (buttons_down, pressed_since_last_poll)
+}
+
+#[cfg(target_os = "windows")]
+pub fn capture_mouse_press_snapshot() -> MousePressSnapshot {
+    let (buttons_down, _) = windows_mouse_button_state();
+    MousePressSnapshot { buttons_down }
+}
+
+#[cfg(target_os = "windows")]
+pub fn poll_mouse_press(previous: MousePressSnapshot) -> MousePressPoll {
+    let (buttons_down, pressed_since_last_poll) = windows_mouse_button_state();
+    let snapshot = MousePressSnapshot { buttons_down };
+    let saw_new_press =
+        pressed_since_last_poll != 0 || (buttons_down & !previous.buttons_down) != 0;
+
+    MousePressPoll {
+        snapshot,
+        is_pressed: buttons_down != 0,
+        saw_new_press,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mouse_buttons_down() -> u8 {
+    let mut buttons_down = 0u8;
+
+    unsafe {
+        if CGEventSourceButtonState(
+            K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE,
+            K_CG_MOUSE_BUTTON_LEFT,
+        ) {
+            buttons_down |= 1;
+        }
+        if CGEventSourceButtonState(
+            K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE,
+            K_CG_MOUSE_BUTTON_RIGHT,
+        ) {
+            buttons_down |= 2;
+        }
+        if CGEventSourceButtonState(
+            K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE,
+            K_CG_MOUSE_BUTTON_CENTER,
+        ) {
+            buttons_down |= 4;
+        }
+    }
+
+    buttons_down
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_mouse_press_snapshot() -> MousePressSnapshot {
+    unsafe {
+        MousePressSnapshot {
+            buttons_down: macos_mouse_buttons_down(),
+            left_press_count: CGEventSourceCounterForEventType(
+                K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE,
+                K_CG_EVENT_LEFT_MOUSE_DOWN,
+            ),
+            right_press_count: CGEventSourceCounterForEventType(
+                K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE,
+                K_CG_EVENT_RIGHT_MOUSE_DOWN,
+            ),
+            other_press_count: CGEventSourceCounterForEventType(
+                K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE,
+                K_CG_EVENT_OTHER_MOUSE_DOWN,
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn poll_mouse_press(previous: MousePressSnapshot) -> MousePressPoll {
+    let snapshot = capture_mouse_press_snapshot();
+    let saw_new_press = snapshot.left_press_count > previous.left_press_count
+        || snapshot.right_press_count > previous.right_press_count
+        || snapshot.other_press_count > previous.other_press_count
+        || (snapshot.buttons_down & !previous.buttons_down) != 0;
+
+    MousePressPoll {
+        snapshot,
+        is_pressed: snapshot.buttons_down != 0,
+        saw_new_press,
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn capture_mouse_press_snapshot() -> MousePressSnapshot {
+    MousePressSnapshot::default()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn poll_mouse_press(_previous: MousePressSnapshot) -> MousePressPoll {
+    MousePressPoll::default()
 }
 
 #[cfg(target_os = "windows")]
