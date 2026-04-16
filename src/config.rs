@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::i18n::Language;
 use crate::key_sender::{SendMode, VirtualKey};
 
 #[derive(Serialize, Deserialize)]
 pub struct AppConfig {
     pub send_mode: String,
+    pub language: String,
     pub always_on_top: bool,
     pub tasks: Vec<TaskConfig>,
 }
@@ -21,6 +23,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             send_mode: "PostMessage".to_string(),
+            language: Language::ZhCn.code().to_string(),
             always_on_top: false,
             tasks: vec![TaskConfig {
                 key_name: "ENTER".to_string(),
@@ -37,6 +40,10 @@ impl AppConfig {
             "SendMessage" => SendMode::SendMessage,
             _ => SendMode::PostMessage,
         }
+    }
+
+    pub fn language_enum(&self) -> Language {
+        Language::from_code(&self.language)
     }
 }
 
@@ -68,11 +75,13 @@ pub fn save_config(config: &AppConfig) {
 
 pub fn config_from_state(
     send_mode: SendMode,
+    language: Language,
     always_on_top: bool,
     tasks: &[(VirtualKey, u64)],
 ) -> AppConfig {
     AppConfig {
         send_mode: send_mode.label().to_string(),
+        language: language.code().to_string(),
         always_on_top,
         tasks: tasks
             .iter()
@@ -82,5 +91,26 @@ pub fn config_from_state(
                 interval_ms: *interval,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn default_config_uses_chinese_language() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.language, "zh-CN");
+    }
+
+    #[test]
+    fn language_roundtrip_accepts_chinese_code() {
+        let cfg = AppConfig {
+            language: "zh-CN".to_string(),
+            ..AppConfig::default()
+        };
+
+        assert_eq!(cfg.language_enum().code(), "zh-CN");
     }
 }

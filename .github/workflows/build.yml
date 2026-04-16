@@ -3,7 +3,6 @@ name: Build
 on:
   push:
     branches: [master]
-    tags: ["v*"]
   pull_request:
     branches: [master]
 
@@ -42,19 +41,58 @@ jobs:
           path: target/aarch64-apple-darwin/release/auto-keypress
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: [build-windows, build-macos-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --force --tags
+
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          python3 .github/scripts/release_meta.py \
+            --repo-root . \
+            --github-output "$GITHUB_OUTPUT" \
+            --release-body-path "$RUNNER_TEMP/release-body.md"
+
+      - name: Download artifacts
+        if: steps.meta.outputs.should_release == 'true'
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Ensure release tag
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          TAG_NAME: ${{ steps.meta.outputs.tag_name }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          git fetch --force --tags
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            TAG_SHA="$(git rev-list -n 1 "$TAG_NAME")"
+            if [ "$TAG_SHA" != "$TARGET_SHA" ]; then
+              echo "Tag $TAG_NAME already points to $TAG_SHA, expected $TARGET_SHA"
+              exit 1
+            fi
+          else
+            git tag "$TAG_NAME" "$TARGET_SHA"
+            git push origin "refs/tags/$TAG_NAME"
+          fi
+
       - name: Create Release
+        if: steps.meta.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          body_path: ${{ steps.meta.outputs.release_body_path }}
           files: |
             artifacts/auto-keypress-windows-x64/auto-keypress.exe
             artifacts/auto-keypress-macos-arm64/auto-keypress
-          generate_release_notes: true

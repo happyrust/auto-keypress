@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::key_sender::{SendMode, VirtualKey, send_key};
+use crate::key_sender::{send_key, SendMode, VirtualKey};
 
 #[derive(Clone, Debug)]
 pub struct KeyTask {

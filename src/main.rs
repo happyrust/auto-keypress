@@ -2,12 +2,13 @@
 
 mod app_state;
 mod config;
+mod i18n;
 mod key_sender;
 mod scheduler;
 mod window_picker;
 
-use gpui::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
-use gpui_component::{Root, theme::Theme};
+use gpui::{px, size, AppContext, Bounds, WindowBounds, WindowOptions};
+use gpui_component::{theme::Theme, Root};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -20,11 +21,7 @@ fn main() {
     gpui::Application::new().run(move |cx| {
         gpui_component::init(cx);
 
-        let bounds = Bounds::centered(
-            None,
-            size(px(420.), px(520.)),
-            cx,
-        );
+        let bounds = Bounds::centered(None, size(px(420.), px(520.)), cx);
 
         cx.open_window(
             WindowOptions {

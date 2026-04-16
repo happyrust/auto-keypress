@@ -1,16 +1,19 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
+use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Render, WeakEntity, Window,
-    prelude::{FluentBuilder, InteractiveElement, IntoElement, ParentElement, Styled,
-              StatefulInteractiveElement},
-    rgb,
+    prelude::{
+        FluentBuilder, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+        Styled,
+    },
+    rgb, AppContext, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Render, WeakEntity,
+    Window,
 };
-use gpui_component::{Sizable, h_flex, v_flex};
 use gpui_component::input::{Input, InputState};
+use gpui_component::{h_flex, v_flex, Sizable};
 
+use crate::i18n::{Language, UiText};
 use crate::key_sender::{SendMode, VirtualKey};
 use crate::scheduler::{KeyTask, Scheduler, SendStats};
 use crate::window_picker::WindowInfo;
@@ -20,7 +23,7 @@ fn start_window_drag(window: &Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::UI::{
         Input::KeyboardAndMouse::ReleaseCapture,
-        WindowsAndMessaging::{HTCAPTION, PostMessageA, WM_NCLBUTTONDOWN},
+        WindowsAndMessaging::{PostMessageA, HTCAPTION, WM_NCLBUTTONDOWN},
     };
     if let Ok(handle) = HasWindowHandle::window_handle(window) {
         if let RawWindowHandle::Win32(h) = handle.as_raw() {
@@ -71,6 +74,32 @@ static NEXT_TASK_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 
 fn next_id() -> u32 {
     NEXT_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn can_start(is_running: bool, has_target: bool, accessibility_ready: bool) -> bool {
+    !is_running && has_target && accessibility_ready
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartBlockReason {
+    MissingPermission,
+    MissingTarget,
+}
+
+fn start_block_reason(
+    is_running: bool,
+    has_target: bool,
+    accessibility_ready: bool,
+) -> Option<StartBlockReason> {
+    if is_running {
+        None
+    } else if !accessibility_ready {
+        Some(StartBlockReason::MissingPermission)
+    } else if !has_target {
+        Some(StartBlockReason::MissingTarget)
+    } else {
+        None
+    }
 }
 
 fn keystroke_to_vk(key: &str) -> Option<VirtualKey> {
@@ -127,6 +156,7 @@ pub struct AppState {
     pub is_running: bool,
     pub is_picking: bool,
     pub stats: SendStats,
+    pub language: Language,
     pub always_on_top: bool,
     #[allow(dead_code)]
     hotkey_manager: Option<GlobalHotKeyManager>,
@@ -149,15 +179,18 @@ impl AppState {
                 vk: VirtualKey(tc.vk),
                 interval_ms: tc.interval_ms,
             });
-            let input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder(&tc.interval_ms.to_string())
-            });
+            let input =
+                cx.new(|cx| InputState::new(window, cx).placeholder(&tc.interval_ms.to_string()));
             interval_inputs.insert(tid, input);
         }
 
         if key_tasks.is_empty() {
             let tid = next_id();
-            key_tasks.push(KeyTask { id: tid, vk: VirtualKey(0x0D), interval_ms: 200 });
+            key_tasks.push(KeyTask {
+                id: tid,
+                vk: VirtualKey(0x0D),
+                interval_ms: 200,
+            });
             let input = cx.new(|cx| InputState::new(window, cx).placeholder("200"));
             interval_inputs.insert(tid, input);
         }
@@ -181,6 +214,7 @@ impl AppState {
             is_running: false,
             is_picking: false,
             stats: SendStats::default(),
+            language: cfg.language_enum(),
             always_on_top: cfg.always_on_top,
             hotkey_manager,
         }
@@ -188,11 +222,17 @@ impl AppState {
 
     pub fn save_config(&self, cx: &Context<Self>) {
         self.sync_intervals_snapshot(cx);
-        let tasks: Vec<(VirtualKey, u64)> = self.key_tasks
+        let tasks: Vec<(VirtualKey, u64)> = self
+            .key_tasks
             .iter()
             .map(|t| (t.vk, t.interval_ms))
             .collect();
-        let cfg = crate::config::config_from_state(self.send_mode, self.always_on_top, &tasks);
+        let cfg = crate::config::config_from_state(
+            self.send_mode,
+            self.language,
+            self.always_on_top,
+            &tasks,
+        );
         crate::config::save_config(&cfg);
     }
 
@@ -231,42 +271,50 @@ impl AppState {
 
     fn start_hotkey_listener(cx: &mut Context<Self>) {
         let hotkey_rx = GlobalHotKeyEvent::receiver().clone();
-        cx.spawn(async move |entity: WeakEntity<Self>, async_app| {
-            loop {
-                let rx = hotkey_rx.clone();
-                let event = async_app.background_executor()
-                    .spawn(async move { rx.recv().ok() })
-                    .await;
-                match event {
-                    Some(ev) if ev.state() == HotKeyState::Pressed => {
-                        let ok = entity.update(async_app, |state, cx| {
+        cx.spawn(async move |entity: WeakEntity<Self>, async_app| loop {
+            let rx = hotkey_rx.clone();
+            let event = async_app
+                .background_executor()
+                .spawn(async move { rx.recv().ok() })
+                .await;
+            match event {
+                Some(ev) if ev.state() == HotKeyState::Pressed => {
+                    let ok = entity
+                        .update(async_app, |state, cx| {
                             state.toggle_running(cx);
                             cx.notify();
-                        }).is_ok();
-                        if !ok { break; }
+                        })
+                        .is_ok();
+                    if !ok {
+                        break;
                     }
-                    None => break,
-                    _ => {}
                 }
+                None => break,
+                _ => {}
             }
-        }).detach();
+        })
+        .detach();
     }
 
     fn start_stats_timer(cx: &mut Context<Self>) {
-        cx.spawn(async move |entity: WeakEntity<Self>, async_app| {
-            loop {
-                async_app.background_executor()
-                    .timer(Duration::from_millis(500))
-                    .await;
-                let ok = entity.update(async_app, |state, cx| {
+        cx.spawn(async move |entity: WeakEntity<Self>, async_app| loop {
+            async_app
+                .background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let ok = entity
+                .update(async_app, |state, cx| {
                     if state.is_running {
                         state.refresh_stats();
                         cx.notify();
                     }
-                }).is_ok();
-                if !ok { break; }
+                })
+                .is_ok();
+            if !ok {
+                break;
             }
-        }).detach();
+        })
+        .detach();
     }
 
     pub fn toggle_running(&mut self, cx: &Context<Self>) {
@@ -280,11 +328,17 @@ impl AppState {
 
     fn save_current_config(&mut self, cx: &Context<Self>) {
         self.sync_intervals_from_inputs(cx);
-        let tasks: Vec<(VirtualKey, u64)> = self.key_tasks
+        let tasks: Vec<(VirtualKey, u64)> = self
+            .key_tasks
             .iter()
             .map(|t| (t.vk, t.interval_ms))
             .collect();
-        let cfg = crate::config::config_from_state(self.send_mode, self.always_on_top, &tasks);
+        let cfg = crate::config::config_from_state(
+            self.send_mode,
+            self.language,
+            self.always_on_top,
+            &tasks,
+        );
         crate::config::save_config(&cfg);
     }
 
@@ -318,8 +372,15 @@ impl AppState {
     }
 
     pub fn start(&mut self, cx: &Context<Self>) {
+        if !crate::key_sender::accessibility_trusted() {
+            return;
+        }
+
         let hwnd = match &self.target_window {
-            Some(w) => w.hwnd,
+            Some(w) => match w.target_hwnd() {
+                Some(hwnd) => hwnd,
+                None => return,
+            },
             None => return,
         };
         if self.key_tasks.is_empty() {
@@ -369,32 +430,33 @@ impl AppState {
     }
 
     fn start_picking(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |entity: WeakEntity<Self>, async_app| {
-            loop {
-                async_app.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
+        cx.spawn(async move |entity: WeakEntity<Self>, async_app| loop {
+            async_app
+                .background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
 
-                let should_continue = entity
-                    .update(async_app, |state, cx| {
-                        if !state.is_picking {
-                            return false;
+            let should_continue = entity
+                .update(async_app, |state, cx| {
+                    if !state.is_picking {
+                        return false;
+                    }
+                    if let Some(info) = crate::window_picker::get_window_under_cursor() {
+                        let changed = state
+                            .target_window
+                            .as_ref()
+                            .map_or(true, |w| !w.matches_target(&info));
+                        if changed {
+                            state.target_window = Some(info);
+                            cx.notify();
                         }
-                        if let Some(info) = crate::window_picker::get_window_under_cursor() {
-                            let changed = state.target_window.as_ref()
-                                .map_or(true, |w| w.hwnd != info.hwnd);
-                            if changed {
-                                state.target_window = Some(info);
-                                cx.notify();
-                            }
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
+                    }
+                    true
+                })
+                .unwrap_or(false);
 
-                if !should_continue {
-                    break;
-                }
+            if !should_continue {
+                break;
             }
         })
         .detach();
@@ -413,11 +475,17 @@ impl Render for AppState {
             self.refresh_stats();
         }
 
-        let target_text = self.target_window
+        let text = self.language.labels();
+        let target_text = self
+            .target_window
             .as_ref()
-            .map_or("No window selected".to_string(), |w| w.title.clone());
+            .map_or(text.no_window_selected.to_string(), |w| w.title.clone());
 
-        let pick_label = if self.is_picking { "Stop" } else { "Pick" };
+        let pick_label = if self.is_picking {
+            text.stop
+        } else {
+            text.pick
+        };
         let is_recording = self.recording_task_id.is_some();
 
         v_flex()
@@ -431,14 +499,14 @@ impl Render for AppState {
                     cx.notify();
                 }))
             })
-            .child(self.render_header(cx))
-            .child(self.render_body(&target_text, pick_label, cx))
-            .child(self.render_status_bar())
+            .child(self.render_header(text, cx))
+            .child(self.render_body(text, &target_text, pick_label, cx))
+            .child(self.render_status_bar(text))
     }
 }
 
 impl AppState {
-    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(&self, text: &'static UiText, cx: &Context<Self>) -> impl IntoElement {
         h_flex()
             .id("header-drag")
             .w_full()
@@ -452,17 +520,19 @@ impl AppState {
                 start_window_drag(window);
             })
             .child(
-                h_flex().gap(gpui::px(8.)).items_center()
-                    .child(
-                        gpui::div()
-                            .text_size(gpui::px(16.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(FG))
-                            .child("Auto Keypress")
-                    )
+                h_flex().gap(gpui::px(8.)).items_center().child(
+                    gpui::div()
+                        .text_size(gpui::px(16.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(FG))
+                        .child(text.app_title),
+                ),
             )
             .child(
-                h_flex().gap(gpui::px(4.)).items_center()
+                h_flex()
+                    .gap(gpui::px(4.))
+                    .items_center()
+                    .child(self.render_language_switch(cx))
                     .child(
                         gpui::div()
                             .id("pin-btn")
@@ -479,14 +549,15 @@ impl AppState {
                                 gpui::div()
                                     .text_size(gpui::px(12.))
                                     .text_color(rgb(if self.always_on_top { FG } else { MUTED }))
-                                    .child("📌")
+                                    .child("📌"),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.always_on_top = !this.always_on_top;
                                 set_always_on_top(window, this.always_on_top);
+                                this.save_current_config(cx);
                                 cx.notify();
                             }))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
                     )
                     .child(
                         gpui::div()
@@ -503,12 +574,12 @@ impl AppState {
                                 gpui::div()
                                     .text_size(gpui::px(14.))
                                     .text_color(rgb(MUTED))
-                                    .child("—")
+                                    .child("—"),
                             )
                             .on_click(|_, window, _cx| {
                                 window.minimize_window();
                             })
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
                     )
                     .child(
                         gpui::div()
@@ -525,18 +596,19 @@ impl AppState {
                                 gpui::div()
                                     .text_size(gpui::px(14.))
                                     .text_color(rgb(MUTED))
-                                    .child("×")
+                                    .child("×"),
                             )
                             .on_click(cx.listener(|_this, _, _window, cx| {
                                 cx.quit();
                             }))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    )
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                    ),
             )
     }
 
     fn render_body(
         &self,
+        text: &'static UiText,
         target_text: &str,
         pick_label: &str,
         cx: &Context<Self>,
@@ -544,6 +616,7 @@ impl AppState {
         let is_picking = self.is_picking;
         let is_running = self.is_running;
         let has_target = self.target_window.is_some();
+        let accessibility_ready = crate::key_sender::accessibility_trusted();
         let tasks = self.key_tasks.clone();
 
         v_flex()
@@ -551,15 +624,19 @@ impl AppState {
             .flex_grow()
             .p(gpui::px(16.))
             .gap(gpui::px(16.))
-            .child(self.render_target_section(target_text, pick_label, is_picking, cx))
-            .child(self.render_keys_section(&tasks, cx))
-            .child(self.render_mode_selector(cx))
+            .child(self.render_target_section(text, target_text, pick_label, is_picking, cx))
+            .when(!accessibility_ready, |el| {
+                el.child(self.render_accessibility_notice(text, cx))
+            })
+            .child(self.render_keys_section(text, &tasks, cx))
+            .child(self.render_mode_selector(text, cx))
             .child(gpui::div().w_full().h(gpui::px(1.)).bg(rgb(BORDER)))
-            .child(self.render_controls(is_running, has_target, cx))
+            .child(self.render_controls(text, is_running, has_target, cx))
     }
 
     fn render_target_section(
         &self,
+        text: &'static UiText,
         target_text: &str,
         pick_label: &str,
         is_picking: bool,
@@ -573,7 +650,7 @@ impl AppState {
                 gpui::div()
                     .text_size(gpui::px(12.))
                     .text_color(rgb(MUTED))
-                    .child("Target Window")
+                    .child(text.target_window),
             )
             .child(
                 h_flex()
@@ -594,10 +671,14 @@ impl AppState {
                             .child(
                                 gpui::div()
                                     .text_size(gpui::px(13.))
-                                    .text_color(rgb(if self.target_window.is_some() { FG } else { MUTED }))
+                                    .text_color(rgb(if self.target_window.is_some() {
+                                        FG
+                                    } else {
+                                        MUTED
+                                    }))
                                     .overflow_x_hidden()
-                                    .child(target_owned)
-                            )
+                                    .child(target_owned),
+                            ),
                     )
                     .child(
                         gpui::div()
@@ -615,17 +696,73 @@ impl AppState {
                                     .text_size(gpui::px(13.))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(rgb(FG))
-                                    .child(pick_label.to_string())
+                                    .child(pick_label.to_string()),
                             )
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.toggle_pick(cx);
                                 cx.notify();
-                            }))
-                    )
+                            })),
+                    ),
             )
     }
 
-    fn render_keys_section(&self, tasks: &[KeyTask], cx: &Context<Self>) -> impl IntoElement {
+    fn render_accessibility_notice(
+        &self,
+        text: &'static UiText,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .gap(gpui::px(8.))
+            .p(gpui::px(12.))
+            .bg(rgb(0x4A3320))
+            .rounded(gpui::px(8.))
+            .border_1()
+            .border_color(rgb(WARN))
+            .child(
+                gpui::div()
+                    .text_size(gpui::px(12.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xFFD08A))
+                    .child(text.accessibility_required),
+            )
+            .child(
+                gpui::div()
+                    .text_size(gpui::px(11.))
+                    .line_height(gpui::px(16.))
+                    .text_color(rgb(0xFFE1B8))
+                    .child(text.accessibility_hint),
+            )
+            .child(
+                gpui::div()
+                    .id("open-accessibility-settings-btn")
+                    .cursor_pointer()
+                    .h(gpui::px(30.))
+                    .rounded(gpui::px(6.))
+                    .px(gpui::px(10.))
+                    .bg(rgb(WARN))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        gpui::div()
+                            .text_size(gpui::px(11.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(BG))
+                            .child(text.open_settings),
+                    )
+                    .on_click(cx.listener(|_this, _, _window, _cx| {
+                        let _ = crate::key_sender::open_accessibility_settings();
+                    })),
+            )
+    }
+
+    fn render_keys_section(
+        &self,
+        text: &'static UiText,
+        tasks: &[KeyTask],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let mut section = v_flex().w_full().gap(gpui::px(8.));
 
         section = section.child(
@@ -637,7 +774,7 @@ impl AppState {
                     gpui::div()
                         .text_size(gpui::px(12.))
                         .text_color(rgb(MUTED))
-                        .child("Key Tasks")
+                        .child(text.key_tasks),
                 )
                 .child(
                     gpui::div()
@@ -656,31 +793,40 @@ impl AppState {
                             gpui::div()
                                 .text_size(gpui::px(12.))
                                 .text_color(rgb(FG))
-                                .child("+ Add Key")
+                                .child(text.add_key),
                         )
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.add_key_task(window, cx);
                             cx.notify();
-                        }))
-                )
+                        })),
+                ),
         );
 
         let mut list = v_flex().w_full().gap(gpui::px(6.));
         for task in tasks {
-            list = list.child(self.render_key_row(task, cx));
+            list = list.child(self.render_key_row(text, task, cx));
         }
         section = section.child(list);
 
         section
     }
 
-    fn render_key_row(&self, task: &KeyTask, cx: &Context<Self>) -> impl IntoElement {
+    fn render_key_row(
+        &self,
+        text: &'static UiText,
+        task: &KeyTask,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let task_id = task.id;
         let key_name = task.vk.name().to_string();
         let is_recording = self.recording_task_id == Some(task_id);
 
         let badge_bg = if is_recording { WARN } else { SECONDARY };
-        let badge_text = if is_recording { "Press..." } else { &key_name };
+        let badge_text = if is_recording {
+            text.press_key
+        } else {
+            &key_name
+        };
 
         let mut row = h_flex()
             .id(("row", task_id))
@@ -713,7 +859,7 @@ impl AppState {
                         .text_size(gpui::px(if is_recording { 11. } else { 13. }))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(rgb(if is_recording { BG } else { FG }))
-                        .child(badge_text.to_string())
+                        .child(badge_text.to_string()),
                 )
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     if this.recording_task_id == Some(task_id) {
@@ -722,7 +868,7 @@ impl AppState {
                         this.recording_task_id = Some(task_id);
                     }
                     cx.notify();
-                }))
+                })),
         );
 
         row = row
@@ -731,18 +877,14 @@ impl AppState {
                 gpui::div()
                     .text_size(gpui::px(11.))
                     .text_color(rgb(MUTED))
-                    .child("Interval")
+                    .child(text.interval),
             );
 
         if let Some(input_entity) = self.interval_inputs.get(&task_id) {
             row = row.child(
                 gpui::div()
                     .w(gpui::px(80.))
-                    .child(
-                        Input::new(input_entity)
-                            .appearance(false)
-                            .small()
-                    )
+                    .child(Input::new(input_entity).appearance(false).small()),
             );
         }
 
@@ -750,7 +892,7 @@ impl AppState {
             gpui::div()
                 .text_size(gpui::px(11.))
                 .text_color(rgb(MUTED))
-                .child("ms")
+                .child(text.milliseconds),
         );
 
         row = row.child(gpui::div().flex_grow());
@@ -769,18 +911,18 @@ impl AppState {
                     gpui::div()
                         .text_size(gpui::px(14.))
                         .text_color(rgb(DANGER))
-                        .child("×")
+                        .child("×"),
                 )
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     this.remove_key_task(task_id);
                     cx.notify();
-                }))
+                })),
         );
 
         row
     }
 
-    fn render_mode_selector(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_mode_selector(&self, text: &'static UiText, cx: &Context<Self>) -> impl IntoElement {
         let current = self.send_mode;
         let modes = SendMode::all();
 
@@ -806,18 +948,23 @@ impl AppState {
                 .items_center()
                 .bg(rgb(if active { PRIMARY } else { SECONDARY }));
 
-            if is_first { tab = tab.rounded_l(gpui::px(5.)); }
-            if is_last { tab = tab.rounded_r(gpui::px(5.)); }
+            if is_first {
+                tab = tab.rounded_l(gpui::px(5.));
+            }
+            if is_last {
+                tab = tab.rounded_r(gpui::px(5.));
+            }
 
             tab = tab.child(
                 gpui::div()
                     .text_size(gpui::px(10.))
                     .text_color(rgb(if active { FG } else { MUTED }))
-                    .child(m.label().to_string())
+                    .child(m.label().to_string()),
             );
 
             tab = tab.on_click(cx.listener(move |this, _, _window, cx| {
                 this.send_mode = m;
+                this.save_current_config(cx);
                 cx.notify();
             }));
 
@@ -832,7 +979,7 @@ impl AppState {
                 gpui::div()
                     .text_size(gpui::px(12.))
                     .text_color(rgb(MUTED))
-                    .child("Send Mode")
+                    .child(text.send_mode),
             )
             .child(gpui::div().flex_grow())
             .child(tabs)
@@ -840,82 +987,131 @@ impl AppState {
 
     fn render_controls(
         &self,
+        text: &'static UiText,
         is_running: bool,
-        _has_target: bool,
+        has_target: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        h_flex()
+        let accessibility_ready = crate::key_sender::accessibility_trusted();
+        let start_enabled = can_start(is_running, has_target, accessibility_ready);
+        let block_reason = start_block_reason(is_running, has_target, accessibility_ready);
+        let block_message = match block_reason {
+            Some(StartBlockReason::MissingPermission) => Some(text.start_needs_permission),
+            Some(StartBlockReason::MissingTarget) => Some(text.start_needs_window),
+            None => None,
+        };
+
+        v_flex()
             .w_full()
-            .gap(gpui::px(10.))
-            .items_center()
+            .gap(gpui::px(6.))
             .child(
-                gpui::div()
-                    .id("start-btn")
-                    .cursor_pointer()
-                    .flex_grow()
-                    .h(gpui::px(40.))
-                    .bg(rgb(if is_running { SECONDARY } else { PRIMARY }))
-                    .rounded(gpui::px(8.))
-                    .flex()
+                h_flex()
+                    .w_full()
+                    .gap(gpui::px(10.))
                     .items_center()
-                    .justify_center()
-                    .gap(gpui::px(8.))
-                    .when(!is_running, |el| {
-                        el.child(
-                            gpui::div()
-                                .text_size(gpui::px(14.))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(FG))
-                                .child("▶ Start")
-                        )
-                    })
-                    .when(is_running, |el| {
-                        el.child(
-                            gpui::div()
-                                .text_size(gpui::px(14.))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(MUTED))
-                                .child("Running...")
-                        )
-                    })
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        if !this.is_running {
-                            this.start(cx);
-                        }
-                        cx.notify();
-                    }))
-            )
-            .child(
-                gpui::div()
-                    .id("stop-btn")
-                    .cursor_pointer()
-                    .flex_grow()
-                    .h(gpui::px(40.))
-                    .bg(rgb(SECONDARY))
-                    .rounded(gpui::px(8.))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(gpui::px(8.))
                     .child(
                         gpui::div()
-                            .text_size(gpui::px(14.))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(FG))
-                            .child("■ Stop")
+                            .id("start-btn")
+                            .cursor_pointer()
+                            .flex_grow()
+                            .h(gpui::px(40.))
+                            .bg(rgb(if is_running {
+                                SECONDARY
+                            } else if start_enabled {
+                                PRIMARY
+                            } else {
+                                INPUT_BG
+                            }))
+                            .rounded(gpui::px(8.))
+                            .border_1()
+                            .border_color(rgb(if start_enabled { PRIMARY } else { BORDER }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(gpui::px(8.))
+                            .when(!is_running, |el| {
+                                el.child(
+                                    gpui::div()
+                                        .text_size(gpui::px(14.))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(rgb(if start_enabled { FG } else { MUTED }))
+                                        .child(text.start),
+                                )
+                            })
+                            .when(is_running, |el| {
+                                el.child(
+                                    gpui::div()
+                                        .text_size(gpui::px(14.))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(rgb(MUTED))
+                                        .child(text.running),
+                                )
+                            })
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                if can_start(
+                                    this.is_running,
+                                    this.target_window.is_some(),
+                                    crate::key_sender::accessibility_trusted(),
+                                ) {
+                                    this.start(cx);
+                                }
+                                cx.notify();
+                            })),
                     )
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.stop();
-                        cx.notify();
-                    }))
+                    .child(
+                        gpui::div()
+                            .id("stop-btn")
+                            .cursor_pointer()
+                            .flex_grow()
+                            .h(gpui::px(40.))
+                            .bg(rgb(SECONDARY))
+                            .rounded(gpui::px(8.))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(gpui::px(8.))
+                            .child(
+                                gpui::div()
+                                    .text_size(gpui::px(14.))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(FG))
+                                    .child(text.stop),
+                            )
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.stop();
+                                this.save_current_config(cx);
+                                cx.notify();
+                            })),
+                    ),
             )
+            .when(block_message.is_some(), |el| {
+                el.child(
+                    gpui::div()
+                        .text_size(gpui::px(11.))
+                        .text_color(rgb(WARN))
+                        .child(block_message.unwrap_or_default()),
+                )
+            })
     }
 
-    fn render_status_bar(&self) -> impl IntoElement {
-        let status_text = if self.is_running { "Running" } else { "Ready" };
-        let status_color = if self.is_running { SUCCESS } else { MUTED };
+    fn render_status_bar(&self, text: &'static UiText) -> impl IntoElement {
+        let accessibility_ready = crate::key_sender::accessibility_trusted();
+        let status_text = if !accessibility_ready {
+            text.accessibility_required
+        } else if self.is_running {
+            text.running_status
+        } else {
+            text.ready
+        };
+        let status_color = if !accessibility_ready {
+            WARN
+        } else if self.is_running {
+            SUCCESS
+        } else {
+            MUTED
+        };
 
         let mut stats_parts: Vec<String> = Vec::new();
         for task in &self.key_tasks {
@@ -946,29 +1142,111 @@ impl AppState {
                             .w(gpui::px(8.))
                             .h(gpui::px(8.))
                             .rounded(gpui::px(4.))
-                            .bg(rgb(status_color))
+                            .bg(rgb(status_color)),
                     )
                     .child(
                         gpui::div()
                             .text_size(gpui::px(11.))
                             .text_color(rgb(MUTED))
-                            .child(status_text.to_string())
-                    )
+                            .child(status_text.to_string()),
+                    ),
             )
             .child(
-                h_flex().gap(gpui::px(12.)).items_center()
+                h_flex()
+                    .gap(gpui::px(12.))
+                    .items_center()
                     .child(
                         gpui::div()
                             .text_size(gpui::px(11.))
                             .text_color(rgb(MUTED))
-                            .child(stats_text)
+                            .child(stats_text),
                     )
                     .child(
                         gpui::div()
                             .text_size(gpui::px(10.))
                             .text_color(rgb(BORDER))
-                            .child("F9: Toggle")
-                    )
+                            .child(text.hotkey_toggle),
+                    ),
             )
+    }
+
+    fn render_language_switch(&self, cx: &Context<Self>) -> impl IntoElement {
+        let mut tabs = h_flex()
+            .h(gpui::px(28.))
+            .bg(rgb(SECONDARY))
+            .rounded(gpui::px(6.))
+            .border_1()
+            .border_color(rgb(BORDER));
+
+        for (index, language) in [Language::En, Language::ZhCn].into_iter().enumerate() {
+            let active = self.language == language;
+            let is_first = index == 0;
+            let is_last = index == 1;
+
+            let mut tab = gpui::div()
+                .id(("lang", index))
+                .cursor_pointer()
+                .h_full()
+                .px(gpui::px(8.))
+                .flex()
+                .items_center()
+                .bg(rgb(if active { PRIMARY } else { SECONDARY }));
+
+            if is_first {
+                tab = tab.rounded_l(gpui::px(5.));
+            }
+            if is_last {
+                tab = tab.rounded_r(gpui::px(5.));
+            }
+
+            tab = tab
+                .child(
+                    gpui::div()
+                        .text_size(gpui::px(10.))
+                        .text_color(rgb(if active { FG } else { MUTED }))
+                        .child(language.switcher_label()),
+                )
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.language = language;
+                    this.save_current_config(cx);
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+            tabs = tabs.child(tab);
+        }
+
+        tabs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{can_start, start_block_reason, StartBlockReason};
+
+    #[test]
+    fn start_requires_idle_target_and_permission() {
+        assert!(can_start(false, true, true));
+        assert!(!can_start(true, true, true));
+        assert!(!can_start(false, false, true));
+        assert!(!can_start(false, true, false));
+    }
+
+    #[test]
+    fn start_block_reason_prefers_permission_then_target() {
+        assert_eq!(
+            start_block_reason(false, true, false),
+            Some(StartBlockReason::MissingPermission)
+        );
+        assert_eq!(
+            start_block_reason(false, false, true),
+            Some(StartBlockReason::MissingTarget)
+        );
+        assert_eq!(
+            start_block_reason(false, false, false),
+            Some(StartBlockReason::MissingPermission)
+        );
+        assert_eq!(start_block_reason(true, false, false), None);
+        assert_eq!(start_block_reason(false, true, true), None);
     }
 }
