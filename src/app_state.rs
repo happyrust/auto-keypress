@@ -59,14 +59,31 @@ fn set_always_on_top(window: &Window, on_top: bool) {
 #[cfg(target_os = "macos")]
 const NS_NORMAL_WINDOW_LEVEL: isize = 0;
 #[cfg(target_os = "macos")]
-const NS_POP_UP_WINDOW_LEVEL: isize = 101;
+const NS_FLOATING_WINDOW_LEVEL: isize = 3;
+#[cfg(target_os = "macos")]
+const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+#[cfg(target_os = "macos")]
+const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+#[cfg(target_os = "macos")]
+const MAC_ALWAYS_ON_TOP_COLLECTION_BEHAVIOR: usize =
+    NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+        | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY;
 
 #[cfg(target_os = "macos")]
 fn mac_window_level(on_top: bool) -> isize {
     if on_top {
-        NS_POP_UP_WINDOW_LEVEL
+        NS_FLOATING_WINDOW_LEVEL
     } else {
         NS_NORMAL_WINDOW_LEVEL
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_collection_behavior(on_top: bool, current: usize) -> usize {
+    if on_top {
+        current | MAC_ALWAYS_ON_TOP_COLLECTION_BEHAVIOR
+    } else {
+        current & !MAC_ALWAYS_ON_TOP_COLLECTION_BEHAVIOR
     }
 }
 
@@ -82,7 +99,13 @@ fn set_always_on_top(window: &Window, on_top: bool) {
             unsafe {
                 let ns_window: *mut Object = msg_send![ns_view, window];
                 if !ns_window.is_null() {
+                    let current_behavior: usize = msg_send![ns_window, collectionBehavior];
+                    let next_behavior = mac_collection_behavior(on_top, current_behavior);
+                    let _: () = msg_send![ns_window, setCollectionBehavior: next_behavior];
                     let _: () = msg_send![ns_window, setLevel: mac_window_level(on_top)];
+                    if on_top {
+                        let _: () = msg_send![ns_window, orderFrontRegardless];
+                    }
                 }
             }
         }
@@ -1317,7 +1340,10 @@ mod tests {
     use super::{advance_pick_frame, can_start, start_block_reason, StartBlockReason};
 
     #[cfg(target_os = "macos")]
-    use super::{mac_window_level, NS_NORMAL_WINDOW_LEVEL, NS_POP_UP_WINDOW_LEVEL};
+    use super::{
+        mac_collection_behavior, mac_window_level, MAC_ALWAYS_ON_TOP_COLLECTION_BEHAVIOR,
+        NS_FLOATING_WINDOW_LEVEL, NS_NORMAL_WINDOW_LEVEL,
+    };
 
     #[test]
     fn start_requires_idle_target_and_permission() {
@@ -1424,6 +1450,26 @@ mod tests {
     #[test]
     fn macos_always_on_top_uses_expected_window_levels() {
         assert_eq!(mac_window_level(false), NS_NORMAL_WINDOW_LEVEL);
-        assert_eq!(mac_window_level(true), NS_POP_UP_WINDOW_LEVEL);
+        assert_eq!(mac_window_level(true), NS_FLOATING_WINDOW_LEVEL);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_always_on_top_adds_collection_behavior_flags() {
+        assert_eq!(
+            mac_collection_behavior(true, 0),
+            MAC_ALWAYS_ON_TOP_COLLECTION_BEHAVIOR
+        );
+        assert_eq!(
+            mac_collection_behavior(true, 1 << 5),
+            (1 << 5) | MAC_ALWAYS_ON_TOP_COLLECTION_BEHAVIOR
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_disabling_always_on_top_keeps_unrelated_collection_behavior_flags() {
+        let current = MAC_ALWAYS_ON_TOP_COLLECTION_BEHAVIOR | (1 << 5) | (1 << 7);
+        assert_eq!(mac_collection_behavior(false, current), (1 << 5) | (1 << 7));
     }
 }
